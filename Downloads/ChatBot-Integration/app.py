@@ -4,30 +4,54 @@ import psycopg2
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
+from time import time
 
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
-# ---------------- CONFIG ---------------
-# ---------------- CONFIG ---------------
-# HF_TOKEN = os.getenv("HUGGINGFACE_API_KEY")
-# DATABASE_URL = os.getenv("DATABASE_URL")
+# ---------------- CONFIG ----------------
+HF_TOKEN = os.getenv("HUGGINGFACE_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not HF_TOKEN:
     raise ValueError("Hugging Face API key not found in environment variables.")
 
-API_URL = "https://router.huggingface.co/hf-inference/models/google/flan-t5-large"
+# ✅ FIXED: Switched to a proper conversational model
+API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1"
 
 headers = {
     "Authorization": f"Bearer {HF_TOKEN}",
     "Content-Type": "application/json"
 }
 
-# ---------------- DATABASE CONNECTION ----------------
+# ---------------- DATABASE ----------------
 def get_db_connection():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL not set in environment variables.")
     return psycopg2.connect(DATABASE_URL)
+
+# ✅ NEW: Create table if it doesn't exist on startup
+def init_db():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(255),
+                email VARCHAR(255),
+                message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("✅ Database initialized.")
+    except Exception as e:
+        print(f"⚠️ DB init error: {e}")
 
 # ---------------- FAQ ENGINE ----------------
 FAQS = {
@@ -112,74 +136,109 @@ FAQS = {
 
 # ---------------- AI CALL FUNCTION ----------------
 def call_huggingface_api(user_message):
+    # ✅ FIXED: Proper instruct-style prompt for Mistral
     prompt = (
-        "You are a professional assistant for VORTEX company website. "
-        "Be concise, clear, and helpful.\n\n"
-        f"User: {user_message}\nAssistant:"
+        "<s>[INST] You are a professional assistant for VORTEX, a premium tech studio. "
+        "Answer questions about VORTEX concisely and helpfully. "
+        "If unsure, recommend contacting hello@vortex.engineering.\n\n"
+        f"{user_message} [/INST]"
     )
 
     payload = {
         "inputs": prompt,
         "parameters": {
-            "max_new_tokens": 200,
-            "temperature": 0.7,
-            "return_full_text": False
+            "max_new_tokens": 150,
+            "temperature": 0.6,
+            "return_full_text": False,
+            "stop": ["</s>", "[INST]"]  # ✅ FIXED: Stop tokens to prevent runaway output
         }
     }
 
-    response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+    try:
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
 
-    if response.status_code != 200:
-        print("HF Error:", response.text)
-        return "AI service is temporarily unavailable."
+        # ✅ FIXED: Handle model loading (503) gracefully
+        if response.status_code == 503:
+            return "Our AI assistant is warming up. Please try again in a moment."
 
-    result = response.json()
+        if response.status_code != 200:
+            print(f"HF Error {response.status_code}:", response.text)
+            return "AI service is temporarily unavailable. Please email hello@vortex.engineering."
 
-    # Handle loading or error response
-    if isinstance(result, dict) and result.get("error"):
-        print("HF Model Error:", result["error"])
-        return "AI model is loading. Please try again in a moment."
+        result = response.json()
 
-    if isinstance(result, list) and len(result) > 0:
-        return result[0]["generated_text"].strip()
+        if isinstance(result, dict) and result.get("error"):
+            print("HF Model Error:", result["error"])
+            return "AI model is loading. Please try again in a moment."
 
-    return "I couldn't generate a response."
+        if isinstance(result, list) and len(result) > 0:
+            text = result[0].get("generated_text", "").strip()
+            return text if text else "I couldn't generate a response."
+
+        return "I couldn't generate a response."
+
+    # ✅ FIXED: Catch timeout separately for clearer error
+    except requests.exceptions.Timeout:
+        return "The request timed out. Please try again."
+    except Exception as e:
+        print("HF call exception:", e)
+        return "Something went wrong with the AI service."
 
 # ---------------- ROUTES ----------------
 @app.route("/")
 def home():
-    return render_template("chatbot.html")
+    return render_template("chatbot.html", timestamp=int(time()))
+
 
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
         data = request.get_json()
+
+        # ✅ FIXED: Gracefully handle missing/malformed JSON body
+        if not data:
+            return jsonify({"reply": "Invalid request. Please send a JSON body."}), 400
+
         user_message = data.get("message", "").strip()
 
         if not user_message:
             return jsonify({"reply": "Please enter a message."})
 
+        # ✅ FIXED: Basic length guard to prevent prompt injection / abuse
+        if len(user_message) > 500:
+            return jsonify({"reply": "Your message is too long. Please keep it under 500 characters."})
+
         lower_message = user_message.lower()
 
-        # 1️⃣ FAQ First
+        # 1️⃣ FAQ Match First (exact substring)
         for key, value in FAQS.items():
             if key in lower_message:
                 return jsonify({"reply": value})
 
-        # 2️⃣ Navigation
+        # 2️⃣ Navigation Hints
+        # ✅ NOTE: Your HTML frontend must handle these "action" keys in JS
         if "contact" in lower_message:
-            return jsonify({"reply": "Scrolling to contact section...", "action": "contact"})
+            return jsonify({
+                "reply": "You can reach us at hello@vortex.engineering or scroll to the contact section below!",
+                "action": "contact"
+            })
 
         if "team" in lower_message:
-            return jsonify({"reply": "Here’s our team 👇", "action": "team"})
+            return jsonify({
+                "reply": "Meet our amazing team below 👇",
+                "action": "team"
+            })
 
-        # 3️⃣ Lead Trigger
-        if "hire" in lower_message or "collaborate" in lower_message:
-            return jsonify({"reply": "Please share your name, email, and requirement.", "lead": True})
+        # 3️⃣ Lead Capture Trigger
+        # ✅ NOTE: Your HTML frontend must handle the "lead" flag to show a form
+        if any(word in lower_message for word in ["hire", "collaborate", "work with you", "get started"]):
+            return jsonify({
+                "reply": "We'd love to work with you! Please share your name, email, and project details.",
+                "lead": True
+            })
 
         # 4️⃣ AI Fallback
         ai_reply = call_huggingface_api(user_message)
-
         return jsonify({"reply": ai_reply})
 
     except Exception as e:
@@ -192,95 +251,39 @@ def save_lead():
     try:
         data = request.get_json()
 
+        # ✅ FIXED: Validate all required fields before DB insert
         if not data:
-            return jsonify({"status": "error", "message": "No data received"}), 400
+            return jsonify({"status": "error", "message": "No data received."}), 400
 
         name = data.get("name", "").strip()
         email = data.get("email", "").strip()
         message = data.get("message", "").strip()
 
-        send_confirmation_email(email, name, message)
+        if not name or not email or not message:
+            return jsonify({"status": "error", "message": "Name, email, and message are required."}), 400
 
-        # ✅ Basic validation
-        if not name or not message:
-            return jsonify({
-                "status": "error",
-                "message": "Name and message are required."
-            }), 400
+        # ✅ FIXED: Basic email format check
+        if "@" not in email or "." not in email:
+            return jsonify({"status": "error", "message": "Invalid email address."}), 400
 
         conn = get_db_connection()
         cur = conn.cursor()
-
-        insert_query = """
-            INSERT INTO leads (name, email, message)
-            VALUES (%s, %s, %s)
-            RETURNING id;
-        """
-
-        cur.execute(insert_query, (name, email, message))
-        inserted_id = cur.fetchone()[0]
-
+        cur.execute(
+            "INSERT INTO leads (name, email, message) VALUES (%s, %s, %s)",
+            (name, email, message)
+        )
         conn.commit()
         cur.close()
         conn.close()
 
-        print(f"Lead saved successfully with ID: {inserted_id}")
-
-        return jsonify({
-            "status": "success",
-            "lead_id": inserted_id
-        })
+        return jsonify({"status": "success", "message": "Thanks! We'll be in touch soon."})
 
     except Exception as e:
         print("DB Error:", e)
-        return jsonify({
-            "status": "error",
-            "message": "Database insert failed"
-        }), 500
+        return jsonify({"status": "error", "message": "Database error. Please try again."}), 500
 
 
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-
-EMAIL_USER = os.getenv("EMAIL_USER")
-EMAIL_PASS = os.getenv("EMAIL_PASS")
-
-
-def send_confirmation_email(to_email, name, message):
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "We Received Your Message | VORTEX"
-        msg["From"] = EMAIL_USER
-        msg["To"] = to_email
-
-        html_content = f"""
-        <html>
-            <body>
-                <h2>Hi {name},</h2>
-                <p>Thanks for reaching out to VORTEX.</p>
-                <p>We received your message:</p>
-                <blockquote>{message}</blockquote>
-                <br>
-                <p>Our team will get back to you shortly.</p>
-                <br>
-                <strong>VORTEX Team</strong>
-            </body>
-        </html>
-        """
-
-        msg.attach(MIMEText(html_content, "html"))
-
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.starttls()
-            server.login(EMAIL_USER, EMAIL_PASS)
-            server.sendmail(EMAIL_USER, to_email, msg.as_string())
-
-        print("Confirmation email sent.")
-
-    except Exception as e:
-        print("Email Error:", e)
-
-
+# ✅ FIXED: Run DB init before starting the server
 if __name__ == "__main__":
+    init_db()
     app.run(debug=True)
