@@ -12,8 +12,8 @@ CORS(app)
 
 # ---------------- CONFIG ---------------
 # ---------------- CONFIG ---------------
-HF_TOKEN = os.getenv("HUGGINGFACE_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")
+# HF_TOKEN = os.getenv("HUGGINGFACE_API_KEY")
+# DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not HF_TOKEN:
     raise ValueError("Hugging Face API key not found in environment variables.")
